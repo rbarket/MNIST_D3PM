@@ -9,8 +9,13 @@ import matplotlib
 matplotlib.use("Agg")       # <-- important: headless backend
 import matplotlib.pyplot as plt
 
-from data import get_mnist_dataloaders
 
+from data import get_mnist_dataloaders
+from diffusion.transition import (
+    linear_beta_schedule,
+    build_all_transition_matrices,
+    compute_cumulative_transition_matrices
+)
 
 def save_samples(images, labels, num=8, filename="samples.png"):
     """
@@ -29,7 +34,7 @@ def save_samples(images, labels, num=8, filename="samples.png"):
 
 
 def main():
-    # Load MNIST loaders
+    # 1) Load MNIST loaders
     train_loader, _ = get_mnist_dataloaders(
         batch_size=32,
         data_root="./data",
@@ -44,6 +49,16 @@ def main():
 
     # Save sample images instead of showing them
     save_samples(x, y, filename="mnist_samples.png")
+
+    T = 5 # timesteps
+    betas = linear_beta_schedule(T)
+    Qs = build_all_transition_matrices(betas)
+    Qbar = compute_cumulative_transition_matrices(Qs)
+
+    print("Q1:\n", Qs[0])
+    
+    print("Qbar[2]:\n", Qbar[1])
+    print("Qbar[T]:\n", Qbar[T-1])
 
 
 if __name__ == "__main__":
