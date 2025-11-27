@@ -1,4 +1,5 @@
 import torch
+import torch.distributions as dist
 
 # -----------------------------------------------
 # Step 1: Define β_t (noise schedule)
@@ -93,3 +94,38 @@ def compute_cumulative_transition_matrices(Qs):
         Q_bar[t] = cumulative
 
     return Q_bar
+
+
+def sample_q_xt_given_x0(x0, t, Qbar):
+    """
+    Sample x_t ~ q(x_t | x0) using the cumulative transition matrix Qbar[t].
+
+    Args:
+        x0: Tensor of shape [B, 1, H, W] with values 0 or 1
+        t: integer timestep (0 <= t < T)
+        Qbar: Tensor of shape [T, 2, 2]
+
+    Returns:
+        x_t: Tensor of shape [B, 1, H, W], values in {0,1}
+    """
+    # Qbar_t: shape [2, 2]
+    Qbar_t = Qbar[t]     # transition for timestep t
+
+    # Flatten for vectorized distribution sampling
+    x0_flat = x0.view(-1)          # shape [B*H*W]
+    BHW = x0_flat.shape[0]
+
+    # Gather the probability vector for each pixel
+    # Example: if x0_flat[i] = 0 → Qbar_t[0], else Qbar_t[1]
+    probs = Qbar_t[x0_flat]        # shape [B*H*W, 2]
+
+    # Create categorical distribution
+    categorical = dist.Categorical(probs=probs)
+
+    # Sample x_t for each pixel
+    xt_flat = categorical.sample()
+
+    # Reshape back to image format
+    xt = xt_flat.view_as(x0)
+
+    return xt

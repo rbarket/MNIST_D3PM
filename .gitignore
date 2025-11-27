@@ -1,4 +1,5 @@
 /.vscode
 /__pycache__
+/diffusion/__pycache__
 /data
 /mnist_samples.png
