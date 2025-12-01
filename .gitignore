@@ -1,6 +1,7 @@
 /.vscode
 /__pycache__
 /data
+/training/checkpoints
 /mnist_samples.png
 
 __pycache__/
