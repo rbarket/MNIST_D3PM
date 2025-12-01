@@ -1,6 +1,8 @@
 /.vscode
 /__pycache__
-/diffusion/__pycache__
-/models/__pycache__
 /data
 /mnist_samples.png
+
+__pycache__/
+*.py[cod]
+**/__pycache__/
