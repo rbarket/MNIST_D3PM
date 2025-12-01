@@ -1,131 +1,129 @@
 import torch
 import torch.distributions as dist
 
-# -----------------------------------------------
-# Step 1: Define β_t (noise schedule)
-# -----------------------------------------------
+# ---------- SCHEDULES ----------
+
 def linear_beta_schedule(T, beta_start=1e-4, beta_end=0.5):
-    """
-    Linear schedule for beta_t values.
-    
-    Args:
-        T: number of diffusion steps
-        beta_start: initial noise value
-        beta_end: final noise value (max=0.5 for binary categories)
-    
-    Returns:
-        betas: Tensor of shape [T]
-    """
     return torch.linspace(beta_start, beta_end, T)
 
 
 def cosine_beta_schedule(T, s=0.008):
-    """
-    Cosine schedule adapted from continuous diffusion (Nichol & Dhariwal),
-    but works fine for discrete too.
-    """
     steps = T + 1
     x = torch.linspace(0, T, steps)
     alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * torch.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-
-    # beta_t = 1 - (alpha_bar_t / alpha_bar_{t-1})
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    betas = torch.clamp(betas, 0.0001, 0.5)   # ensure within valid range
-    return betas
+    return torch.clamp(betas, 0.0001, 0.5)
 
 
-# -----------------------------------------------
-# Step 2: Build Q_t for K=2 (binary categories)
-# -----------------------------------------------
+# ---------- TRANSITION MATRICES ----------
+
 def build_transition_matrix(beta_t):
-    """
-    Construct a 2x2 transition matrix Q_t for binary diffusion.
-    
-    Q_t = [[1 - beta_t, beta_t],
-           [beta_t, 1 - beta_t]]
-
-    Args:
-        beta_t: scalar float or tensor
-    
-    Returns:
-        Q_t: Tensor of shape [2, 2]
-    """
-    Q_t = torch.tensor([
+    return torch.tensor([
         [1 - beta_t, beta_t],
-        [beta_t, 1 - beta_t]
+        [beta_t,     1 - beta_t]
     ], dtype=torch.float32)
-
-    return Q_t
 
 
 def build_all_transition_matrices(betas):
-    """
-    Build a stack of all Q_t for t in 1..T
-    
-    Args:
-        betas: Tensor of shape [T]
-    
-    Returns:
-        Q: Tensor of shape [T, 2, 2]
-    """
-    Qs = torch.stack([build_transition_matrix(beta) for beta in betas])
-    return Qs
+    return torch.stack([build_transition_matrix(b) for b in betas])  # [T,2,2]
 
 
-def compute_cumulative_transition_matrices(Qs):
-    """
-    Compute cumulative transition matrices:
-        Q_bar[t] = Q1 @ Q2 @ ... @ Qt
-
-    Args:
-        Qs: Tensor of shape [T, 2, 2] representing Q1..QT
-
-    Returns:
-        Q_bar: Tensor of shape [T, 2, 2]
-    """
+def compute_cumulative_transition_matrices(Qs, device=None):
     T = Qs.shape[0]
-    Q_bar = torch.zeros_like(Qs)
-
-    # Start cumulative product with Q1
-    cumulative = torch.eye(2)  # identity matrix for initial product
+    Qbar = torch.zeros_like(Qs)
+    # Keep running product on the same device/dtype as Qs to avoid CPU/GPU mismatch
+    cumulative = torch.eye(2, device=Qs.device, dtype=Qs.dtype)
     for t in range(T):
-        cumulative = cumulative @ Qs[t]      # multiply in sequence
-        Q_bar[t] = cumulative
+        cumulative = cumulative @ Qs[t]
+        Qbar[t] = cumulative
+    return Qbar  # [T,2,2]
 
-    return Q_bar
+
+# ---------- q(x_t | x_0) SAMPLING ----------
+
+def _sample_q_xt_given_x0_scalar_t(x0, t, Qbar):
+    """
+    Internal helper for a single scalar t.
+    x0: any shape, integer {0,1}
+    """
+    Qbar_t = Qbar[t]          # [2,2]
+    probs = Qbar_t[x0]        # [...,2]
+    xt = dist.Categorical(probs=probs).sample()
+    return xt
 
 
 def sample_q_xt_given_x0(x0, t, Qbar):
     """
-    Sample x_t ~ q(x_t | x0) using the cumulative transition matrix Qbar[t].
+    Sample x_t ~ q(x_t | x0) with either:
+      - scalar t (int)
+      - per-sample t: LongTensor of shape [B]
 
-    Args:
-        x0: Tensor of shape [B, 1, H, W] with values 0 or 1
-        t: integer timestep (0 <= t < T)
-        Qbar: Tensor of shape [T, 2, 2]
-
-    Returns:
-        x_t: Tensor of shape [B, 1, H, W], values in {0,1}
+    x0: LongTensor [B,1,H,W] (for MNIST) or any shape
+    t:  int  OR  LongTensor [B]
+    Qbar: [T,2,2]
     """
-    # Qbar_t: shape [2, 2]
-    Qbar_t = Qbar[t]     # transition for timestep t
+    if isinstance(t, int):
+        # old behavior: one t for whole batch
+        return _sample_q_xt_given_x0_scalar_t(x0, t, Qbar)
 
-    # Flatten for vectorized distribution sampling
-    x0_flat = x0.view(-1)          # shape [B*H*W]
-    BHW = x0_flat.shape[0]
-
-    # Gather the probability vector for each pixel
-    # Example: if x0_flat[i] = 0 → Qbar_t[0], else Qbar_t[1]
-    probs = Qbar_t[x0_flat]        # shape [B*H*W, 2]
-
-    # Create categorical distribution
-    categorical = dist.Categorical(probs=probs)
-
-    # Sample x_t for each pixel
-    xt_flat = categorical.sample()
-
-    # Reshape back to image format
-    xt = xt_flat.view_as(x0)
-
+    # t is tensor [B]: one timestep per sample
+    assert t.dim() == 1, "t should be shape [B] when tensor"
+    B = x0.shape[0]
+    xt_list = []
+    for i in range(B):
+        xt_i = _sample_q_xt_given_x0_scalar_t(x0[i], int(t[i].item()), Qbar)
+        xt_list.append(xt_i.unsqueeze(0))  # keep batch dim
+    xt = torch.cat(xt_list, dim=0)
     return xt
+
+
+# ---------- q(x_{t-1} | x_t, x_0) POSTERIOR ----------
+
+def _compute_discrete_posterior_scalar_t(xt, x0, t, Qs, Qbar):
+    """
+    Internal helper for scalar t.
+    xt, x0: same shape, integer {0,1}
+    Returns: posterior [...,2]
+    """
+    if t <= 0:
+        raise ValueError("t must be >= 1.")
+
+    Q_t = Qs[t]          # [2,2]
+    Qbar_tm1 = Qbar[t-1] # [2,2]
+
+    # term1 = q(x_t | x_{t-1}=k) = Q_t[k, x_t]
+    term1 = Q_t[:, xt]             # [2,...]
+    term1 = term1.movedim(0, -1)   # [...,2]
+
+    # term2 = q(x_{t-1}=k | x0) = Qbar_{t-1}[x0, k]
+    term2 = Qbar_tm1[x0]           # [...,2]
+
+    unnormalized = term1 * term2   # [...,2]
+    posterior = unnormalized / (unnormalized.sum(dim=-1, keepdim=True) + 1e-20)
+    return posterior               # [...,2]
+
+
+def compute_discrete_posterior(xt, x0, t, Qs, Qbar):
+    """
+    Compute q(x_{t-1} | x_t, x0) with either:
+      - scalar t (int)
+      - per-sample t: LongTensor [B]
+
+    xt, x0: [B,1,H,W]
+    Returns: [B,1,H,W,2]
+    """
+    if isinstance(t, int):
+        post = _compute_discrete_posterior_scalar_t(xt, x0, t, Qs, Qbar)
+        return post  # [B,1,H,W,2]
+
+    assert t.dim() == 1, "t should be shape [B] when tensor"
+    B = x0.shape[0]
+    post_list = []
+    for i in range(B):
+        post_i = _compute_discrete_posterior_scalar_t(
+            xt[i], x0[i], int(t[i].item()), Qs, Qbar
+        )  # [1,H,W,2] since xt[i] has shape [1,H,W]
+        post_list.append(post_i.unsqueeze(0))  # add batch dim
+    posterior = torch.cat(post_list, dim=0)   # [B,1,H,W,2]
+    return posterior
