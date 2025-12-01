@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import DataLoader
+from typing import Optional
 from torchvision import datasets, transforms
 
 
@@ -21,6 +22,9 @@ def get_mnist_dataloaders(
     data_root: str = "./data",
     num_workers: int = 4,
     threshold: float = 0.5,
+    train_subset_size: Optional[int] = None,
+    test_subset_size: Optional[int] = None,
+    subset_seed: int = 0,
 ):
     """
     Returns MNIST train/test loaders with binary images.
@@ -30,6 +34,9 @@ def get_mnist_dataloaders(
         data_root (str): MNIST directory.
         num_workers (int): DataLoader workers.
         threshold (float): Binarization threshold.
+        train_subset_size (Optional[int]): If set, randomly sample this many training examples.
+        test_subset_size (Optional[int]): If set, randomly sample this many test examples.
+        subset_seed (int): RNG seed used for subset sampling.
 
     Returns:
         train_loader, test_loader
@@ -53,6 +60,17 @@ def get_mnist_dataloaders(
         download=True,
         transform=transform,
     )
+
+    # Optionally downsample datasets for quick experiments
+    if train_subset_size is not None:
+        gen = torch.Generator().manual_seed(subset_seed)
+        indices = torch.randperm(len(train_dataset), generator=gen)[:train_subset_size]
+        train_dataset = torch.utils.data.Subset(train_dataset, indices)
+
+    if test_subset_size is not None:
+        gen = torch.Generator().manual_seed(subset_seed)
+        indices = torch.randperm(len(test_dataset), generator=gen)[:test_subset_size]
+        test_dataset = torch.utils.data.Subset(test_dataset, indices)
 
     train_loader = DataLoader(
         train_dataset,
