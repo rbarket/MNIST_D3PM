@@ -134,27 +134,33 @@ class Trainer:
     # Compute denoising metrics on *entire train set*
     # --------------------------------------------------------------
     @torch.no_grad()
-    def compute_train_metrics(self, t_eval=30):
+    def compute_train_metrics(self, t_eval=30, include_final=True):
         """
         Evaluate denoising quality across the ENTIRE train set
         using the full batch-level metrics from metrics.py.
+        By default computes metrics at both t_eval and the final timestep T-1.
         """
 
         self.model.eval()
-        metrics_accum = {
-            "pixel_acc": 0.0,
-            "fg_acc": 0.0,
-            "bg_acc": 0.0,
-            "balanced_acc": 0.0,
-            "hamming": 0.0,
-            "mae": 0.0,
-        }
+        def empty_metrics():
+            return {
+                "pixel_acc": 0.0,
+                "fg_acc": 0.0,
+                "bg_acc": 0.0,
+                "balanced_acc": 0.0,
+                "hamming": 0.0,
+                "mae": 0.0,
+            }
+
+        metrics_eval = empty_metrics()
+        metrics_final = empty_metrics() if include_final else None
         total_batches = 0
+        t_final = self.T - 1
 
         for x0, _ in self.train_loader:
             x0 = x0.to(self.device).long()
 
-            batch_metrics = evaluate_denoising(
+            batch_metrics_eval = evaluate_denoising(
                 model=self.model,
                 x0=x0,
                 t=t_eval,
@@ -162,16 +168,32 @@ class Trainer:
                 device=self.device,
             )
 
-            for key in metrics_accum:
-                metrics_accum[key] += batch_metrics[key]
+            for key in metrics_eval:
+                metrics_eval[key] += batch_metrics_eval[key]
+
+            if include_final:
+                batch_metrics_final = evaluate_denoising(
+                    model=self.model,
+                    x0=x0,
+                    t=t_final,
+                    Qbar=self.Qbar,
+                    device=self.device,
+                )
+                for key in metrics_final:
+                    metrics_final[key] += batch_metrics_final[key]
 
             total_batches += 1
 
         # Average metrics over batches
-        for key in metrics_accum:
-            metrics_accum[key] /= total_batches
+        for key in metrics_eval:
+            metrics_eval[key] /= total_batches
 
-        return metrics_accum
+        if include_final:
+            for key in metrics_final:
+                metrics_final[key] /= total_batches
+            return {"t_eval": metrics_eval, "t_final": metrics_final, "t_eval_value": t_eval, "t_final_value": t_final}
+
+        return {"t_eval": metrics_eval, "t_eval_value": t_eval}
 
     # --------------------------------------------------------------
     # Full training loop
@@ -240,10 +262,15 @@ class Trainer:
                     print(f"  {k}: {v:.4f}")
 
                 # ----------- NEW: Full train-set denoising metrics -----------
-                train_metrics = self.compute_train_metrics(t_eval=t_eval)
+                train_metrics = self.compute_train_metrics(t_eval=t_eval, include_final=True)
                 print("\n  Denoising metrics on full train set:")
-                for k, v in train_metrics.items():
-                    print(f"    {k}: {v:.4f}")
+                print(f"    At t={train_metrics['t_eval_value']}:")
+                for k, v in train_metrics["t_eval"].items():
+                    print(f"      {k}: {v:.4f}")
+                if "t_final" in train_metrics:
+                    print(f"    At t={train_metrics['t_final_value']} (final):")
+                    for k, v in train_metrics["t_final"].items():
+                        print(f"      {k}: {v:.4f}")
 
                 # ----------- Visualize fixed example -----------
                 visualize_denoising(
