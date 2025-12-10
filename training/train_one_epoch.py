@@ -66,17 +66,17 @@ def train_one_epoch(
             logits_x0, xt, t, Qs, Qbar
         )                                              # [B,1,H,W,2]
 
-        # ---------- 7. KL(q || p_theta) ----------
-        log_q = torch.log(q_posterior + 1e-20)
-        log_p = torch.log(p_theta + 1e-20)
+        # (7) KL(q || p_theta)
+        log_q = torch.log(q_posterior + 1e-12)
+        log_p = torch.log(p_theta + 1e-12)
         kl = (q_posterior * (log_q - log_p)).sum(dim=-1).mean()
 
-        # ---------- 8. Auxiliary CE term (-log p̃_theta(x0|x_t)) ----------
-        p_tilde = F.softmax(logits_x0, dim=1)          # [B,2,H,W]
-        p_x0 = p_tilde.gather(1, x0)                   # [B,1,H,W]
-        aux_ce = -(torch.log(p_x0 + 1e-20)).mean()
+        # (8) Aux CE term using log_softmax
+        log_p_tilde = F.log_softmax(logits_x0, dim=1)      # [B,K,H,W]
+        log_p_x0 = log_p_tilde.gather(1, x0)               # x0 is [B,1,H,W]
+        aux_ce = -(log_p_x0).mean()
 
-        # ---------- 9. Final Eq. (5) loss ----------
+        # (9) Final loss
         loss = kl + lambda_aux * aux_ce
 
         # ---------- 10. Backprop ----------

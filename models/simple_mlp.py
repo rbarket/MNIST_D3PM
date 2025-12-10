@@ -1,31 +1,30 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class SimpleD3PMMLP(nn.Module):
     """
-    Very simple 2-layer MLP for D3PM:
+    Minimal 3-layer MLP for D3PM:
     - Takes x_t (binary MNIST image) and timestep t
     - Outputs logits for x0: [B, K=2, 28, 28]
-    - Uses a small timestep embedding
     """
 
-    def __init__(self, img_size=28*28, hidden_dim=1024, K=2, T=100):
+    def __init__(self, img_size=28*28, hidden_dim1=1024, hidden_dim2=512, K=2, T=100):
         super().__init__()
 
         self.img_size = img_size
         self.K = K
 
-        # ----- Timestep Embedding -----
         # Learn an embedding for t in {0,...,T-1}
-        self.timestep_embed = nn.Embedding(T, hidden_dim)
+        self.timestep_embed = nn.Embedding(T, hidden_dim1)
 
-        # ----- MLP -----
+        # Simple feedforward stack: input -> h1 -> h2 -> logits
         self.mlp = nn.Sequential(
-            nn.Linear(img_size + hidden_dim, hidden_dim),
+            nn.Linear(img_size + hidden_dim1, hidden_dim1),
             nn.ReLU(),
-            nn.Linear(hidden_dim, img_size * K),   # Output 2 logits per pixel
+            nn.Linear(hidden_dim1, hidden_dim2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim2, img_size * K),
         )
 
     def forward(self, x_t, t):
@@ -45,13 +44,11 @@ class SimpleD3PMMLP(nn.Module):
         else:
             t = t.to(device).long()
 
-        # Timestep embedding: [B, hidden_dim]
+        # Timestep embedding: [B, hidden_dim1]
         t_emb = self.timestep_embed(t)
 
-        # Concatenate
+        # Concatenate and forward
         h = torch.cat([x_flat, t_emb], dim=1)
-
-        # MLP forward
         out = self.mlp(h)                    # [B, 784*K]
 
         # Reshape to logits for each pixel

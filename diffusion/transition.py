@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import torch.distributions as dist
 
 # ---------- SCHEDULES ----------
@@ -67,14 +68,20 @@ def sample_q_xt_given_x0(x0, t, Qbar):
         # old behavior: one t for whole batch
         return _sample_q_xt_given_x0_scalar_t(x0, t, Qbar)
 
-    # t is tensor [B]: one timestep per sample
+    # Vectorized per-sample timesteps
     assert t.dim() == 1, "t should be shape [B] when tensor"
-    B = x0.shape[0]
-    xt_list = []
-    for i in range(B):
-        xt_i = _sample_q_xt_given_x0_scalar_t(x0[i], int(t[i].item()), Qbar)
-        xt_list.append(xt_i.unsqueeze(0))  # keep batch dim
-    xt = torch.cat(xt_list, dim=0)
+    B, _, H, W = x0.shape
+    x0_long = x0.long().view(B, -1)                     # [B, N]
+
+    # Select Qbar for each sample's timestep and build per-pixel probs
+    Qbar_t = Qbar[t]                                    # [B, K, K]
+    x0_onehot = F.one_hot(x0_long, num_classes=Qbar_t.shape[-1]).float()  # [B, N, K]
+    probs_flat = torch.bmm(x0_onehot, Qbar_t)           # [B, N, K]
+    probs_flat = probs_flat.clamp(min=1e-12)            # avoid degenerate probs
+
+    # Sample all pixels at once
+    xt_flat = torch.multinomial(probs_flat.view(-1, probs_flat.shape[-1]), 1)  # [B*N, 1]
+    xt = xt_flat.view(B, 1, H, W)
     return xt
 
 
@@ -118,12 +125,27 @@ def compute_discrete_posterior(xt, x0, t, Qs, Qbar):
         return post  # [B,1,H,W,2]
 
     assert t.dim() == 1, "t should be shape [B] when tensor"
-    B = x0.shape[0]
-    post_list = []
-    for i in range(B):
-        post_i = _compute_discrete_posterior_scalar_t(
-            xt[i], x0[i], int(t[i].item()), Qs, Qbar
-        )  # [1,H,W,2] since xt[i] has shape [1,H,W]
-        post_list.append(post_i.unsqueeze(0))  # add batch dim
-    posterior = torch.cat(post_list, dim=0)   # [B,1,H,W,2]
+    B, _, H, W = xt.shape
+    N = H * W
+    K = Qs.shape[-1]
+
+    xt_flat = xt.long().view(B, N)                      # [B, N]
+    x0_flat = x0.long().view(B, N)                      # [B, N]
+
+    Q_t = Qs[t]                                         # [B, K, K]
+    Qbar_tm1 = Qbar[t - 1]                              # [B, K, K]
+
+    # term1 = q(x_t | x_{t-1}=k) for each pixel: gather columns for xt
+    Q_t_expanded = Q_t.unsqueeze(2).expand(-1, -1, N, -1)             # [B, K, N, K]
+    xt_idx = xt_flat.unsqueeze(1).unsqueeze(-1).expand(-1, K, -1, 1)  # [B, K, N, 1]
+    term1 = Q_t_expanded.gather(3, xt_idx).squeeze(-1)                # [B, K, N]
+    term1 = term1.permute(0, 2, 1)                                    # [B, N, K]
+
+    # term2 = q(x_{t-1}=k | x0)
+    x0_onehot = F.one_hot(x0_flat, num_classes=K).float()             # [B, N, K]
+    term2 = torch.bmm(x0_onehot, Qbar_tm1)                            # [B, N, K]
+
+    unnormalized = term1 * term2
+    posterior_flat = unnormalized / (unnormalized.sum(dim=2, keepdim=True) + 1e-20)
+    posterior = posterior_flat.view(B, H, W, K).unsqueeze(1)          # [B,1,H,W,K]
     return posterior
