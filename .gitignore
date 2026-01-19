@@ -1,4 +1,5 @@
 /.vscode
+/.aim
 /__pycache__
 /data
 /training/checkpoints
