@@ -44,37 +44,52 @@ def group_norm(num_channels: int, max_groups: int = 8) -> nn.GroupNorm:
         g -= 1
     return nn.GroupNorm(g, num_channels)
 
-def make_resblock_stack(in_ch: int, out_ch: int, n: int, time_dim: int) -> nn.ModuleList:
+def make_resblock_stack(in_ch: int, out_ch: int, n: int, cond_dim: int) -> nn.ModuleList:
     blocks = []
-    blocks.append(ResBlock(in_ch, out_ch, time_dim))
+    blocks.append(ResBlock(in_ch, out_ch, cond_dim))
     for _ in range(n - 1):
-        blocks.append(ResBlock(out_ch, out_ch, time_dim))
+        blocks.append(ResBlock(out_ch, out_ch, cond_dim))
     return nn.ModuleList(blocks)
 
 
 class ResBlock(nn.Module):
     """
-    Residual block with additive time conditioning.
+    Residual block with FiLM conditioning (scale/shift) from a conditioning vector.
 
-    x -> GN+SiLU+Conv -> + time -> GN+SiLU+Conv -> + skip
+    x -> GN -> FiLM(cond) -> SiLU -> Conv -> GN -> FiLM(cond) -> SiLU -> Conv -> + skip
     """
-    def __init__(self, in_ch: int, out_ch: int, time_dim: int):
+    def __init__(self, in_ch: int, out_ch: int, cond_dim: int):
         super().__init__()
         self.norm1 = group_norm(in_ch)
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
-
-        self.time_proj = nn.Linear(time_dim, out_ch)
 
         self.norm2 = group_norm(out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
 
         self.skip = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, kernel_size=1)
 
-    def forward(self, x: torch.Tensor, t_feat: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(F.silu(self.norm1(x)))
-        h = h + self.time_proj(t_feat).unsqueeze(-1).unsqueeze(-1)
-        h = self.conv2(F.silu(self.norm2(h)))
+        # Two FiLM projections (one per normalization)
+        self.film1 = nn.Linear(cond_dim, 2 * in_ch)   # gamma/beta for norm1 channels
+        self.film2 = nn.Linear(cond_dim, 2 * out_ch)  # gamma/beta for norm2 channels
+
+    def _apply_film(self, h: torch.Tensor, film: nn.Linear, cond: torch.Tensor) -> torch.Tensor:
+        gb = film(cond)  # (B, 2C)
+        gamma, beta = gb.chunk(2, dim=-1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        return h * (1.0 + gamma) + beta
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        h = self._apply_film(h, self.film1, cond)
+        h = self.conv1(F.silu(h))
+
+        h = self.norm2(h)
+        h = self._apply_film(h, self.film2, cond)
+        h = self.conv2(F.silu(h))
+
         return h + self.skip(x)
+
 
 
 class Downsample(nn.Module):
@@ -104,6 +119,8 @@ class UNetConfig:
     time_emb_dim: int = 64
     time_hidden_dim: int = 256
     num_res_blocks: int = 2   # per resolution
+    cond_num_classes: int = 10      # MNIST labels
+    cond_emb_dim: int = 64          # label embedding dim (usually = time_emb_dim)
 
 
 class SmallUNetLogits(nn.Module):
@@ -120,6 +137,14 @@ class SmallUNetLogits(nn.Module):
         super().__init__()
         self.cfg = cfg
         c = cfg.base_channels
+        
+        self.label_emb = nn.Embedding(cfg.cond_num_classes, cfg.cond_emb_dim)
+
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(cfg.time_hidden_dim, cfg.time_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(cfg.time_hidden_dim, cfg.time_hidden_dim),
+        )
 
         # time MLP
         self.time_mlp = nn.Sequential(
@@ -154,7 +179,7 @@ class SmallUNetLogits(nn.Module):
         self.out_norm = group_norm(c)
         self.out_proj = nn.Conv2d(c, cfg.num_classes, kernel_size=1)
 
-    def forward(self, xt: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, xt: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         if xt.dtype in (torch.int32, torch.int64):
             xt = xt.float()
         elif not torch.is_floating_point(xt):
@@ -163,9 +188,17 @@ class SmallUNetLogits(nn.Module):
         if t.ndim != 1 or t.dtype not in (torch.int32, torch.int64):
             raise TypeError(f"t must be (B,) int tensor, got shape={tuple(t.shape)} dtype={t.dtype}")
 
-        # time features
+        if y.ndim != 1 or y.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"y must be (B,) int tensor, got shape={tuple(y.shape)} dtype={y.dtype}")
+
+        if y.shape[0] != t.shape[0]:
+            raise ValueError(f"batch mismatch: y.shape[0]={y.shape[0]} vs t.shape[0]={t.shape[0]}")
+
+        # time features + label conditioning (additive in embedding space)
         t_emb = timestep_embedding(t, self.cfg.time_emb_dim)   # (B, time_emb_dim)
-        t_feat = self.time_mlp(t_emb)                          # (B, time_hidden_dim)
+        y_emb = self.label_emb(y)                              # (B, time_emb_dim)
+        t_feat = self.cond_mlp(self.time_mlp(t_emb + y_emb))   # (B, time_hidden_dim)
+
 
         # in
         x = self.in_proj(xt)
@@ -187,7 +220,7 @@ class SmallUNetLogits(nn.Module):
         x = self.mid2(x, t_feat)
 
         # upsample
-        x = self.upsample(x)  # (B,2c,H,W) (for even sizes)
+        x = self.upsample(x)  # (B,2c,H,W)
 
         # if sizes mismatch due to odd dimensions, crop to skip
         if x.shape[-2:] != skip.shape[-2:]:
@@ -203,3 +236,4 @@ class SmallUNetLogits(nn.Module):
 
         logits = self.out_proj(F.silu(self.out_norm(x)))  # (B,K,H,W)
         return logits
+

@@ -42,9 +42,19 @@ def load_model(ckpt: str, device: torch.device, K: int) -> torch.nn.Module:
 
 
 def resolve_ckpt_path(ckpt: str) -> str:
-    if os.path.isabs(ckpt) or os.path.dirname(ckpt):
+    if os.path.isabs(ckpt):
         return ckpt
-    return os.path.join("outputs", "models", ckpt)
+    if os.path.exists(ckpt):
+        return ckpt
+    candidates = [
+        os.path.join("models", ckpt),
+        os.path.join("outputs", "model", ckpt),
+        os.path.join("outputs", "models", ckpt),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 
 @torch.no_grad()
@@ -54,6 +64,7 @@ def reconstruct_from_xt(
     xt: torch.Tensor,
     t_start: int,
     *,
+    y: torch.Tensor,
     deterministic_last: bool = True,
 ) -> torch.Tensor:
     """
@@ -65,7 +76,7 @@ def reconstruct_from_xt(
 
     for step in range(t_start, 0, -1):
         t = torch.full((B,), step, device=device, dtype=torch.long)
-        logits_x0 = model(x, t)  # (B,K,H,W)
+        logits_x0 = model(x, t, y)  # (B,K,H,W)
         p_xtm1 = p_theta_xtm1_given_xt(forward, logits_x0, x, t)  # (B,1,H,W,K)
 
         if deterministic_last and step == 1:
@@ -144,12 +155,19 @@ def eval_per_timestep(
 
         it = iter(loader)
         for _ in range(batches_per_t):
-            x, _ = next(it)
-            x = x.to(device)
+            x, y = next(it)
+            x, y = x.to(device), y.to(device)
             x0 = discretize(x, forward.K)
 
             xt = forward.sample_xt(x0, t)
-            xhat = reconstruct_from_xt(model, forward, xt, t, deterministic_last=deterministic_last)
+            xhat = reconstruct_from_xt(
+                model,
+                forward,
+                xt,
+                t,
+                y=y,
+                deterministic_last=deterministic_last,
+            )
             m = batch_metrics(x0, xhat, forward.K)
 
             bsz = x0.shape[0]
@@ -219,8 +237,14 @@ def main():
         "--out_subdir",
         type=str,
         default="",
-        help="optional subfolder name under outputs/metrics/ to save plots+csv",
     )
+    p.add_argument(
+    "--schedule",
+    type=str,
+    default="cosine",
+    choices=["linear", "cosine"],
+)
+
 
     args = p.parse_args()
     
@@ -238,10 +262,21 @@ def main():
 
     ckpt_path = resolve_ckpt_path(args.ckpt)
     model = load_model(ckpt_path, device, args.K)
-    forward = D3PMForward.from_linear_schedule(
-        K=args.K, T=args.T, beta_start=args.beta_start, beta_end=args.beta_end, device=device
-    )
-    print("forward.T =", forward.T)
+    
+    if args.schedule == "linear":
+        forward = D3PMForward.from_linear_schedule(
+            K=args.K,
+            T=args.T,
+            beta_start=args.beta_start,
+            beta_end=args.beta_end,
+            device=device,
+        )
+    else:
+        forward = D3PMForward.from_cosine_schedule(
+            K=args.K,
+            T=args.T,
+            device=device,
+        )
 
     loader = make_test_loader(args.batch_size, args.num_workers)
 

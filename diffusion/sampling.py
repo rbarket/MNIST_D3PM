@@ -95,6 +95,7 @@ def reverse_step(
     xt: torch.Tensor,
     t: Union[int, torch.Tensor],
     *,
+    y: torch.Tensor,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """
@@ -122,7 +123,7 @@ def reverse_step(
         t_tensor = t.to(device=device, dtype=torch.long)
 
     # Model predicts logits for x0
-    logits_x0 = model(xt, t_tensor)  # (B,K,H,W)
+    logits_x0 = model(xt, t_tensor, y)  # (B,K,H,W)
 
     # Convert to p_theta(x_{t-1} | x_t) via D3PM mixture
     p_xtm1 = p_theta_xtm1_given_xt(forward, logits_x0, xt, t_tensor)  # (B,1,H,W,K)
@@ -134,37 +135,50 @@ def reverse_step(
 
 @torch.no_grad()
 def sample_loop(
-    model: nn.Module,
     forward: D3PMForward,
+    model: nn.Module,
+    shape: Tuple[int, ...],
     *,
-    batch_size: int = 16,
-    image_size: Tuple[int, int] = (28, 28),
+    y: torch.Tensor,
     device: Optional[torch.device] = None,
     generator: Optional[torch.Generator] = None,
     return_trajectory: bool = False,
     trajectory_steps: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[Tuple[int, torch.Tensor]]]]:
     """
-    Full sampling loop (Step 5):
+    Full sampling loop:
         x_T ~ p(x_T)
         for t = T..1:
-            x_{t-1} ~ p_theta(x_{t-1} | x_t)
+            x_{t-1} ~ p_theta(x_{t-1} | x_t, y)
 
     Args:
+        shape: (B, C, H, W) of discrete states (usually C=1 for MNIST).
+        y: (B,) long labels (mandatory).
         return_trajectory: if True, also return selected intermediate x_t states.
-        trajectory_steps: list of timesteps to store (e.g. [T, T//2, 1]).
-                          If None and return_trajectory=True, stores [T, T//2, 1].
+        trajectory_steps: timesteps to store (values in [0..T]). If None and return_trajectory=True,
+                          stores [T, T//2, 0].
+
     Returns:
-        x0: (B,1,H,W) long
-        (optional) trajectory: list of (t, x_t_copy) with x_t tensors on CPU
+        x0: (B, C, H, W) long
+        optionally: trajectory: list of (t, x_t_cpu) where t is the timestep index.
     """
-    device = device if device is not None else next(model.parameters()).device
-    H, W = image_size
+    if device is None:
+        device = next(model.parameters()).device
+
+    if len(shape) != 4:
+        raise ValueError(f"shape must be (B,C,H,W); got {shape}")
+
+    B, C, H, W = shape
+
+    # Enforce label shape/device
+    y = y.to(device)
+    if y.dim() != 1 or y.shape[0] != B:
+        raise ValueError(f"y must be shape (B,); got {tuple(y.shape)} for B={B}")
 
     # Start from x_T
     xt = sample_prior(
         forward,
-        (batch_size, 1, H, W),
+        (B, C, H, W),
         device=device,
         generator=generator,
     )
@@ -172,20 +186,26 @@ def sample_loop(
     traj: List[Tuple[int, torch.Tensor]] = []
     if return_trajectory:
         if trajectory_steps is None:
-            trajectory_steps = [forward.T, max(1, forward.T // 2), 1]
-        trajectory_steps = sorted(set(trajectory_steps), reverse=True)
+            trajectory_steps = [forward.T, max(1, forward.T // 2), 0]
+        # keep unique, valid, sorted descending
+        trajectory_steps = sorted({int(s) for s in trajectory_steps if 0 <= int(s) <= forward.T}, reverse=True)
 
         if forward.T in trajectory_steps:
             traj.append((forward.T, xt.detach().cpu()))
 
-    # Reverse chain
+    # Reverse chain: t = T, ..., 1
     for t in range(forward.T, 0, -1):
-        xt = reverse_step(model, forward, xt, t, generator=generator)  # now xt is x_{t-1}
+        xt = reverse_step(
+            model,
+            forward,
+            xt,
+            t,
+            y=y,
+            generator=generator,
+        )  # xt is now x_{t-1}
 
-        if return_trajectory and trajectory_steps is not None and t - 1 in trajectory_steps:
+        if return_trajectory and trajectory_steps is not None and (t - 1) in trajectory_steps:
             traj.append((t - 1, xt.detach().cpu()))
 
-    x0 = xt  # after finishing t=1 step, xt is x_0
-    if return_trajectory:
-        return x0, traj
-    return x0
+    x0 = xt
+    return (x0, traj) if return_trajectory else x0

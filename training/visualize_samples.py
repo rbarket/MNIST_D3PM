@@ -51,9 +51,19 @@ def load_model(ckpt_path: str, device: torch.device) -> torch.nn.Module:
 
 
 def resolve_ckpt_path(ckpt: str) -> str:
-    if os.path.isabs(ckpt) or os.path.dirname(ckpt):
+    if os.path.isabs(ckpt):
         return ckpt
-    return os.path.join("outputs", "models", ckpt)
+    if os.path.exists(ckpt):
+        return ckpt
+    candidates = [
+        os.path.join("models", ckpt),
+        os.path.join("outputs", "model", ckpt),
+        os.path.join("outputs", "models", ckpt),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 @torch.no_grad()
 def plot_grid(

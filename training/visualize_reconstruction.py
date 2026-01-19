@@ -40,9 +40,19 @@ def load_model(ckpt: str, device: torch.device, K: int) -> torch.nn.Module:
 
 
 def resolve_ckpt_path(ckpt: str) -> str:
-    if os.path.isabs(ckpt) or os.path.dirname(ckpt):
+    if os.path.isabs(ckpt):
         return ckpt
-    return os.path.join("outputs", "models", ckpt)
+    if os.path.exists(ckpt):
+        return ckpt
+    candidates = [
+        os.path.join("models", ckpt),
+        os.path.join("outputs", "model", ckpt),
+        os.path.join("outputs", "models", ckpt),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 
 @torch.no_grad()
@@ -52,6 +62,7 @@ def reconstruct_with_snapshots(
     xt: torch.Tensor,          # (B,1,H,W) long
     t_start: int,
     *,
+    y: torch.Tensor,
     snapshot_ts: list[int],    # timesteps to record (include t_start and 0 if desired)
     deterministic_last: bool = True,
 ):
@@ -72,7 +83,7 @@ def reconstruct_with_snapshots(
 
     for step in range(t_start, 0, -1):
         t = torch.full((B,), step, device=device, dtype=torch.long)
-        logits_x0 = model(x, t)  # (B,K,H,W)
+        logits_x0 = model(x, t, y)  # (B,K,H,W)
         p_xtm1 = p_theta_xtm1_given_xt(forward, logits_x0, x, t)  # (B,1,H,W,K)
 
         if deterministic_last and step == 1:
@@ -189,6 +200,12 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--name", type=str, default="reconstruction_snapshots.png")
     p.add_argument("--K", type=int, default=4)
+    p.add_argument(
+    "--schedule",
+    type=str,
+    default="cosine",
+    choices=["linear", "cosine"],
+ )
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -201,9 +218,21 @@ def main():
     ckpt_path = resolve_ckpt_path(args.ckpt)
     model = load_model(ckpt_path, device, args.K)
 
-    forward = D3PMForward.from_linear_schedule(
-        K=args.K, T=args.T, beta_start=args.beta_start, beta_end=args.beta_end, device=device
-    )
+    if args.schedule == "linear":
+        forward = D3PMForward.from_linear_schedule(
+            K=args.K,
+            T=args.T,
+            beta_start=args.beta_start,
+            beta_end=args.beta_end,
+            device=device,
+        )
+    else:
+        forward = D3PMForward.from_cosine_schedule(
+            K=args.K,
+            T=args.T,
+            device=device,
+        )
+
 
 
     # Load MNIST test set
@@ -228,6 +257,7 @@ def main():
         xt,
         args.t,
         snapshot_ts=snapshot_ts,
+        y=y,
         deterministic_last=True,
     )
 

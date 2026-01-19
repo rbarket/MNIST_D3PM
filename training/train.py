@@ -44,25 +44,54 @@ def batch_metrics(
     return {"pixel_acc": pix_acc, "macro_acc": macro_acc}
 
 
-@torch.no_grad()
 def eval_fixed_timesteps(
     model: torch.nn.Module,
     forward: D3PMForward,
     x0: torch.Tensor,
     timesteps: List[int],
+    y: torch.Tensor,  # REQUIRED
 ) -> Dict[str, float]:
-    """
-    Evaluate x0-prediction accuracy for a fixed x0 batch at a few timesteps.
-    """
     out: Dict[str, float] = {}
     for tt in timesteps:
         xt = forward.sample_xt(x0, tt)
         t = torch.full((x0.shape[0],), tt, device=x0.device, dtype=torch.long)
-        logits = model(xt, t)
+        logits = model(xt, t, y)  # REQUIRED
         mets = batch_metrics(logits, x0, K=forward.K)
         for k, v in mets.items():
             out[f"{k}@t={tt}"] = v
     return out
+
+
+@torch.no_grad()
+def eval_loss_over_loader(
+    model: torch.nn.Module,
+    forward: D3PMForward,
+    data_loader: torch.utils.data.DataLoader,
+    *,
+    aux_weight: float,
+    device: torch.device,
+) -> Dict[str, float]:
+    totals = {"loss": 0.0, "L_t-1": 0.0, "L_aux": 0.0}
+    count = 0
+    for x0, y in data_loader:
+        x0 = x0.to(device)
+        y = y.to(device)
+
+        xt, t = make_noised_batch(forward, x0)
+        out = d3pm_loss(
+            forward=forward,
+            model=model,
+            x0=x0,
+            xt=xt,
+            t=t,
+            aux_weight=aux_weight,
+            y=y,  # REQUIRED
+        )
+        totals["loss"] += float(out.loss.item())
+        totals["L_t-1"] += float(out.L_tminus1.item())
+        totals["L_aux"] += float(out.L_aux.item())
+        count += 1
+    return {k: v / max(1, count) for k, v in totals.items()}
 
 
 def format_metrics(d: Dict[str, float], keys: List[str]) -> str:
@@ -71,6 +100,45 @@ def format_metrics(d: Dict[str, float], keys: List[str]) -> str:
         if k in d:
             parts.append(f"{k}: {d[k]:.4f}")
     return "  ".join(parts)
+
+
+def save_checkpoint(
+    path: str,
+    *,
+    model: torch.nn.Module,
+    optim: torch.optim.Optimizer,
+    epoch: int,
+    global_step: int,
+    args: argparse.Namespace,
+) -> None:
+    ckpt = {
+        "state_dict": model.state_dict(),
+        "optim": optim.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "args": vars(args),
+    }
+    torch.save(ckpt, path)
+
+
+def load_checkpoint(
+    path: str,
+    *,
+    model: torch.nn.Module,
+    optim: torch.optim.Optimizer | None,
+    device: torch.device,
+) -> tuple[int, int, bool]:
+    ckpt = torch.load(path, map_location=device)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        model.load_state_dict(ckpt["state_dict"], strict=True)
+        if optim is not None and "optim" in ckpt:
+            optim.load_state_dict(ckpt["optim"])
+        epoch = int(ckpt.get("epoch", 0))
+        global_step = int(ckpt.get("global_step", 0))
+        return epoch, global_step, True
+
+    model.load_state_dict(ckpt, strict=True)
+    return 0, 0, False
 
 
 def main():
@@ -103,7 +171,19 @@ def main():
     parser.add_argument("--seed", type=int, default=1998)
 
     # Save
-    parser.add_argument("--out_ckpt", type=str, default="outputs/model.pt")
+    parser.add_argument("--out_ckpt", type=str, default=None)
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume (weights-only or full checkpoint).",
+    )
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=1,
+        help="Save checkpoint every N epochs when --out_ckpt is set (0 disables).",
+    )
 
     args = parser.parse_args()
 
@@ -114,7 +194,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    os.makedirs(os.path.dirname(args.out_ckpt), exist_ok=True)
+    if args.out_ckpt:
+        out_dir = os.path.dirname(args.out_ckpt)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
 
     # Data: now discretized into {0..K-1} inside data.py
     train_loader, test_loader = get_mnist_dataloaders(
@@ -153,27 +236,66 @@ def main():
     model = SmallUNetLogits(cfg).to(device)
     optim = AdamW(model.parameters(), lr=args.lr)
 
-    # Fixed eval batch (test)
-    x0_eval, _ = next(iter(test_loader))
-    x0_eval = x0_eval.to(device)  # (B,1,28,28) long in {0..K-1}
+    try:
+        from aim import Run
+    except Exception as exc:
+        raise RuntimeError(
+            "Aim is required for training. Install aim to track metrics."
+        ) from exc
+    run = Run(repo=".", experiment="mnist-d3pm")
+    run["hparams"] = vars(args)
+
+    start_epoch = 1
+    global_step = 0
+    if args.resume:
+        loaded_epoch, loaded_step, has_optim = load_checkpoint(
+            args.resume,
+            model=model,
+            optim=optim,
+            device=device,
+        )
+        if loaded_epoch > 0:
+            start_epoch = loaded_epoch + 1
+        global_step = loaded_step
+        run["resume_from"] = args.resume
+        if has_optim:
+            print(
+                f"Resumed from checkpoint: {args.resume} "
+                f"(epoch {loaded_epoch}, step {loaded_step})"
+            )
+        else:
+            print(f"Loaded weights from: {args.resume}")
+
+    if start_epoch > args.epochs:
+        print(
+            f"Checkpoint epoch {start_epoch - 1} >= requested epochs {args.epochs}. "
+            "Nothing to do."
+        )
+        run.close()
+        return
+
+    x0_eval, y_eval = next(iter(test_loader))
+    x0_eval = x0_eval.to(device)
+    y_eval = y_eval.to(device)
 
     probe_ts = [1, max(2, args.T // 10), args.T // 2, args.T]
 
-    global_step = 0
-    for epoch in range(1, args.epochs + 1):
+    last_saved_epoch = 0
+    last_epoch = start_epoch - 1
+    for epoch in range(start_epoch, args.epochs + 1):
+        last_epoch = epoch
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=True)
 
         running = {"loss": 0.0, "L_t-1": 0.0, "L_aux": 0.0}
         running_count = 0
 
-        for x0, _ in pbar:
-            x0 = x0.to(device)  # (B,1,H,W) long in {0..K-1}
+        for x0, y in pbar:
+            x0 = x0.to(device)
+            y = y.to(device)
 
-            # Sample x_t and t
             xt, t = make_noised_batch(forward, x0)
 
-            # Compute losses (new API computes logits internally)
             out = d3pm_loss(
                 forward=forward,
                 model=model,
@@ -181,6 +303,7 @@ def main():
                 xt=xt,
                 t=t,
                 aux_weight=args.lambda_aux,
+                y=y,  # REQUIRED
             )
 
             optim.zero_grad(set_to_none=True)
@@ -205,6 +328,27 @@ def main():
                     f"loss {avg['loss']:.4f} | L_t-1 {avg['L_t-1']:.4f} | L_aux {avg['L_aux']:.4f} | "
                     f"pix_acc {pix_acc:.4f} macro_acc {macro_acc:.4f}"
                 )
+                run.track(
+                    avg["loss"],
+                    name="loss",
+                    step=global_step,
+                    epoch=epoch,
+                    context={"subset": "train"},
+                )
+                run.track(
+                    avg["L_t-1"],
+                    name="L_t-1",
+                    step=global_step,
+                    epoch=epoch,
+                    context={"subset": "train"},
+                )
+                run.track(
+                    avg["L_aux"],
+                    name="L_aux",
+                    step=global_step,
+                    epoch=epoch,
+                    context={"subset": "train"},
+                )
                 running = {"loss": 0.0, "L_t-1": 0.0, "L_aux": 0.0}
                 running_count = 0
 
@@ -212,16 +356,69 @@ def main():
         if epoch % args.eval_every == 0:
             model.eval()
             with torch.no_grad():
-                probe = eval_fixed_timesteps(model, forward, x0_eval, probe_ts)
+                probe = eval_fixed_timesteps(model, forward, x0_eval, probe_ts, y=y_eval)
+                test_loss = eval_loss_over_loader(
+                    model,
+                    forward,
+                    test_loader,
+                    aux_weight=args.lambda_aux,
+                    device=device,
+                )
             print("\n[Eval probe on fixed test batch]")
             keys = []
             for tt in probe_ts:
                 keys += [f"pixel_acc@t={tt}", f"macro_acc@t={tt}"]
             print(format_metrics(probe, keys))
+            print(
+                f"test loss {test_loss['loss']:.4f} | "
+                f"L_t-1 {test_loss['L_t-1']:.4f} | L_aux {test_loss['L_aux']:.4f}"
+            )
+            run.track(
+                test_loss["loss"],
+                name="loss",
+                step=global_step,
+                epoch=epoch,
+                context={"subset": "test"},
+            )
+            run.track(
+                test_loss["L_t-1"],
+                name="L_t-1",
+                step=global_step,
+                epoch=epoch,
+                context={"subset": "test"},
+            )
+            run.track(
+                test_loss["L_aux"],
+                name="L_aux",
+                step=global_step,
+                epoch=epoch,
+                context={"subset": "test"},
+            )
             print("")
 
-    torch.save(model.state_dict(), args.out_ckpt)
-    print(f"Saved checkpoint: {args.out_ckpt}")
+        if args.out_ckpt and args.save_every > 0 and epoch % args.save_every == 0:
+            save_checkpoint(
+                args.out_ckpt,
+                model=model,
+                optim=optim,
+                epoch=epoch,
+                global_step=global_step,
+                args=args,
+            )
+            last_saved_epoch = epoch
+            print(f"Saved checkpoint: {args.out_ckpt}")
+
+    if args.out_ckpt and last_epoch >= start_epoch and last_saved_epoch != last_epoch:
+        save_checkpoint(
+            args.out_ckpt,
+            model=model,
+            optim=optim,
+            epoch=last_epoch,
+            global_step=global_step,
+            args=args,
+        )
+        print(f"Saved checkpoint: {args.out_ckpt}")
+    run.close()
 
 
 if __name__ == "__main__":

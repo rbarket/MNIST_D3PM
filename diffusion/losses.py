@@ -82,11 +82,12 @@ class LossOutput:
 def d3pm_loss(
     forward: D3PMForward,
     model: torch.nn.Module,
-    x0: torch.Tensor,             # (B,1,H,W) long in [0..K-1]
-    xt: torch.Tensor,             # (B,1,H,W) long
-    t: torch.Tensor,              # (B,) long
+    x0: torch.Tensor,
+    xt: torch.Tensor,
+    t: torch.Tensor,
     *,
     aux_weight: float = 0.001,
+    y: torch.Tensor,
 ) -> LossOutput:
     """
     Combined objective:
@@ -96,7 +97,7 @@ def d3pm_loss(
         L_{t-1} is the VB/KL term at timestep t (with special-casing t==1 inside posterior)
         L_aux is the CE on x0 prediction
     """
-    logits_x0 = model(xt, t)  # expected (B,K,H,W)
+    logits_x0 = model(xt, t, y)  # expected (B,K,H,W)
 
     Lvb = l_tminus1_vb(forward, logits_x0, x0, xt, t)
     Laux = l_aux_ce(logits_x0, x0)
