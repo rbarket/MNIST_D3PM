@@ -44,13 +44,6 @@ def group_norm(num_channels: int, max_groups: int = 8) -> nn.GroupNorm:
         g -= 1
     return nn.GroupNorm(g, num_channels)
 
-def make_resblock_stack(in_ch: int, out_ch: int, n: int, cond_dim: int) -> nn.ModuleList:
-    blocks = []
-    blocks.append(ResBlock(in_ch, out_ch, cond_dim))
-    for _ in range(n - 1):
-        blocks.append(ResBlock(out_ch, out_ch, cond_dim))
-    return nn.ModuleList(blocks)
-
 
 class ResBlock(nn.Module):
     """
@@ -66,7 +59,11 @@ class ResBlock(nn.Module):
         self.norm2 = group_norm(out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
 
-        self.skip = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.skip = (
+            nn.Identity()
+            if in_ch == out_ch
+            else nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        )
 
         # Two FiLM projections (one per normalization)
         self.film1 = nn.Linear(cond_dim, 2 * in_ch)   # gamma/beta for norm1 channels
@@ -91,6 +88,12 @@ class ResBlock(nn.Module):
         return h + self.skip(x)
 
 
+def make_resblock_stack(in_ch: int, out_ch: int, n: int, cond_dim: int) -> nn.ModuleList:
+    blocks = [ResBlock(in_ch, out_ch, cond_dim)]
+    for _ in range(n - 1):
+        blocks.append(ResBlock(out_ch, out_ch, cond_dim))
+    return nn.ModuleList(blocks)
+
 
 class Downsample(nn.Module):
     def __init__(self, ch: int):
@@ -114,22 +117,26 @@ class Upsample(nn.Module):
 @dataclass
 class UNetConfig:
     in_channels: int = 1
-    num_classes: int = 4      # K
-    base_channels: int = 64   # try 64; reduce to 32 if you want lighter
+    num_classes: int = 4      # K (discrete states per pixel)
+    base_channels: int = 96   # increased from 64; try 96 first, then 128 if VRAM allows
     time_emb_dim: int = 64
     time_hidden_dim: int = 256
     num_res_blocks: int = 2   # per resolution
-    cond_num_classes: int = 10      # MNIST labels
-    cond_emb_dim: int = 64          # label embedding dim (usually = time_emb_dim)
+
+    # Conditioning (MNIST labels)
+    cond_num_classes: int = 10
+    # kept for backward compatibility / config clarity, but stage embeddings use time_emb_dim
+    cond_emb_dim: int = 64
 
 
 class SmallUNetLogits(nn.Module):
     """
-    2-level U-Net for predicting logits of x0 given (xt, t).
+    2-level U-Net for predicting logits of x0 given (xt, t, y).
 
     Input:
       xt: (B,1,H,W) int {0..K-1} or float
       t:  (B,) int timestep
+      y:  (B,) int class label (mandatory)
     Output:
       logits: (B,K,H,W)
     """
@@ -137,18 +144,27 @@ class SmallUNetLogits(nn.Module):
         super().__init__()
         self.cfg = cfg
         c = cfg.base_channels
-        
-        self.label_emb = nn.Embedding(cfg.cond_num_classes, cfg.cond_emb_dim)
 
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(cfg.time_hidden_dim, cfg.time_hidden_dim),
+        # Stage-specific label embeddings (Option A).
+        # Each produces a vector in the same space as the time embedding so we can add: t_emb + y_emb_stage.
+        self.label_embs = nn.ModuleDict({
+            "down1": nn.Embedding(cfg.cond_num_classes, cfg.time_emb_dim),
+            "down2": nn.Embedding(cfg.cond_num_classes, cfg.time_emb_dim),
+            "mid":   nn.Embedding(cfg.cond_num_classes, cfg.time_emb_dim),
+            "up1":   nn.Embedding(cfg.cond_num_classes, cfg.time_emb_dim),
+            "up2":   nn.Embedding(cfg.cond_num_classes, cfg.time_emb_dim),
+        })
+
+        # time MLP (produces a shared hidden conditioning space)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(cfg.time_emb_dim, cfg.time_hidden_dim),
             nn.SiLU(),
             nn.Linear(cfg.time_hidden_dim, cfg.time_hidden_dim),
         )
 
-        # time MLP
-        self.time_mlp = nn.Sequential(
-            nn.Linear(cfg.time_emb_dim, cfg.time_hidden_dim),
+        # extra mixing after time_mlp (helps nonlinearly combine time + label)
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(cfg.time_hidden_dim, cfg.time_hidden_dim),
             nn.SiLU(),
             nn.Linear(cfg.time_hidden_dim, cfg.time_hidden_dim),
         )
@@ -161,7 +177,7 @@ class SmallUNetLogits(nn.Module):
         self.downsample = Downsample(c)
 
         # down level (H/2, W/2)
-        self.down2 = make_resblock_stack(c, 2*c, cfg.num_res_blocks, cfg.time_hidden_dim)
+        self.down2 = make_resblock_stack(c, 2 * c, cfg.num_res_blocks, cfg.time_hidden_dim)
         mid_ch = 2 * c
 
         # bottleneck
@@ -194,18 +210,26 @@ class SmallUNetLogits(nn.Module):
         if y.shape[0] != t.shape[0]:
             raise ValueError(f"batch mismatch: y.shape[0]={y.shape[0]} vs t.shape[0]={t.shape[0]}")
 
-        # time features + label conditioning (additive in embedding space)
-        t_emb = timestep_embedding(t, self.cfg.time_emb_dim)   # (B, time_emb_dim)
-        y_emb = self.label_emb(y)                              # (B, time_emb_dim)
-        t_feat = self.cond_mlp(self.time_mlp(t_emb + y_emb))   # (B, time_hidden_dim)
+        # Shared time embedding
+        t_emb = timestep_embedding(t, self.cfg.time_emb_dim)  # (B, time_emb_dim)
 
+        # Stage-specific conditioning vectors (Option A)
+        def stage_cond(stage: str) -> torch.Tensor:
+            y_emb = self.label_embs[stage](y)  # (B, time_emb_dim)
+            return self.cond_mlp(self.time_mlp(t_emb + y_emb))  # (B, time_hidden_dim)
+
+        t_feat_down1 = stage_cond("down1")
+        t_feat_down2 = stage_cond("down2")
+        t_feat_mid = stage_cond("mid")
+        t_feat_up1 = stage_cond("up1")
+        t_feat_up2 = stage_cond("up2")
 
         # in
         x = self.in_proj(xt)
 
         # down level 1
         for blk in self.down1:
-            x = blk(x, t_feat)
+            x = blk(x, t_feat_down1)
         skip = x  # (B,c,H,W)
 
         # downsample
@@ -213,11 +237,11 @@ class SmallUNetLogits(nn.Module):
 
         # down level 2
         for blk in self.down2:
-            x = blk(x, t_feat)  # (B,2c,H/2,W/2)
+            x = blk(x, t_feat_down2)  # (B,2c,H/2,W/2)
 
         # bottleneck
-        x = self.mid1(x, t_feat)
-        x = self.mid2(x, t_feat)
+        x = self.mid1(x, t_feat_mid)
+        x = self.mid2(x, t_feat_mid)
 
         # upsample
         x = self.upsample(x)  # (B,2c,H,W)
@@ -230,10 +254,9 @@ class SmallUNetLogits(nn.Module):
         # concat skip
         x = torch.cat([x, skip], dim=1)  # (B,2c+c,H,W)
 
-        # up blocks
-        x = self.up1(x, t_feat)
-        x = self.up2(x, t_feat)
+        # up blocks (use separate stage embeddings)
+        x = self.up1(x, t_feat_up1)
+        x = self.up2(x, t_feat_up2)
 
         logits = self.out_proj(F.silu(self.out_norm(x)))  # (B,K,H,W)
         return logits
-

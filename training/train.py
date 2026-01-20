@@ -110,6 +110,7 @@ def save_checkpoint(
     epoch: int,
     global_step: int,
     args: argparse.Namespace,
+    aim_run_hash: str | None,
 ) -> None:
     ckpt = {
         "state_dict": model.state_dict(),
@@ -118,6 +119,8 @@ def save_checkpoint(
         "global_step": global_step,
         "args": vars(args),
     }
+    if aim_run_hash:
+        ckpt["aim_run_hash"] = aim_run_hash
     torch.save(ckpt, path)
 
 
@@ -127,7 +130,7 @@ def load_checkpoint(
     model: torch.nn.Module,
     optim: torch.optim.Optimizer | None,
     device: torch.device,
-) -> tuple[int, int, bool]:
+) -> tuple[int, int, bool, str | None]:
     ckpt = torch.load(path, map_location=device)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         model.load_state_dict(ckpt["state_dict"], strict=True)
@@ -135,10 +138,13 @@ def load_checkpoint(
             optim.load_state_dict(ckpt["optim"])
         epoch = int(ckpt.get("epoch", 0))
         global_step = int(ckpt.get("global_step", 0))
-        return epoch, global_step, True
+        aim_run_hash = ckpt.get("aim_run_hash")
+        if aim_run_hash is not None:
+            aim_run_hash = str(aim_run_hash)
+        return epoch, global_step, True, aim_run_hash
 
     model.load_state_dict(ckpt, strict=True)
-    return 0, 0, False
+    return 0, 0, False, None
 
 
 def main():
@@ -166,6 +172,7 @@ def main():
     # Logging
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--eval_every", type=int, default=1)
+    parser.add_argument("--aim_run_name", type=str, default=None, help="Aim run name")
 
     # Repro
     parser.add_argument("--seed", type=int, default=1998)
@@ -236,19 +243,11 @@ def main():
     model = SmallUNetLogits(cfg).to(device)
     optim = AdamW(model.parameters(), lr=args.lr)
 
-    try:
-        from aim import Run
-    except Exception as exc:
-        raise RuntimeError(
-            "Aim is required for training. Install aim to track metrics."
-        ) from exc
-    run = Run(repo=".", experiment="mnist-d3pm")
-    run["hparams"] = vars(args)
-
     start_epoch = 1
     global_step = 0
+    resume_aim_hash = None
     if args.resume:
-        loaded_epoch, loaded_step, has_optim = load_checkpoint(
+        loaded_epoch, loaded_step, has_optim, resume_aim_hash = load_checkpoint(
             args.resume,
             model=model,
             optim=optim,
@@ -257,7 +256,6 @@ def main():
         if loaded_epoch > 0:
             start_epoch = loaded_epoch + 1
         global_step = loaded_step
-        run["resume_from"] = args.resume
         if has_optim:
             print(
                 f"Resumed from checkpoint: {args.resume} "
@@ -265,6 +263,37 @@ def main():
             )
         else:
             print(f"Loaded weights from: {args.resume}")
+
+    try:
+        from aim import Run
+    except Exception as exc:
+        raise RuntimeError(
+            "Aim is required for training. Install aim to track metrics."
+        ) from exc
+
+    if resume_aim_hash:
+        try:
+            run = Run(repo=".", run_hash=resume_aim_hash)
+        except TypeError:
+            try:
+                run = Run(repo=".", hash=resume_aim_hash)
+            except TypeError:
+                print(
+                    "Warning: Aim Run does not support resuming by hash; "
+                    "starting a new run."
+                )
+                run = Run(repo=".", experiment="mnist-d3pm")
+        except Exception:
+            print("Warning: Failed to resume Aim run; starting a new run.")
+            run = Run(repo=".", experiment="mnist-d3pm")
+    else:
+        run = Run(repo=".", experiment="mnist-d3pm")
+
+    if args.aim_run_name:
+        run.name = args.aim_run_name
+    run["hparams"] = vars(args)
+    if args.resume:
+        run["resume_from"] = args.resume
 
     if start_epoch > args.epochs:
         print(
@@ -282,6 +311,7 @@ def main():
 
     last_saved_epoch = 0
     last_epoch = start_epoch - 1
+    aim_run_hash = getattr(run, "hash", None)
     for epoch in range(start_epoch, args.epochs + 1):
         last_epoch = epoch
         model.train()
@@ -404,6 +434,7 @@ def main():
                 epoch=epoch,
                 global_step=global_step,
                 args=args,
+                aim_run_hash=aim_run_hash,
             )
             last_saved_epoch = epoch
             print(f"Saved checkpoint: {args.out_ckpt}")
@@ -416,6 +447,7 @@ def main():
             epoch=last_epoch,
             global_step=global_step,
             args=args,
+            aim_run_hash=aim_run_hash,
         )
         print(f"Saved checkpoint: {args.out_ckpt}")
     run.close()
